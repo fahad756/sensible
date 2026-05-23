@@ -518,7 +518,7 @@ function normalizeModelText(text) {
 }
 
 function parseDataUrl(dataUrl) {
-  const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  const match = dataUrl.match(/^data:([^;,]+)(?:;[^,]*)*;base64,(.+)$/s);
   if (!match) return null;
   return {
     mimeType: match[1],
