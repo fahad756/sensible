@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: sensible
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: node server/index.mjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-2.5-flash
+      - key: CORS_ORIGIN
+        value: '*'
