@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   BookOpen,
   Bot,
+  Camera,
   Check,
   Copy,
   ExternalLink,
@@ -12,6 +13,7 @@ import {
   Headphones,
   Loader2,
   MonitorUp,
+  Pause,
   Play,
   QrCode,
   Radio,
@@ -697,6 +699,9 @@ export default function App() {
         captureStatus={captureStatus}
         switchToDesktop={() => setView("desktop")}
         switchToAbout={() => setView("about")}
+        socket={socket}
+        apiBase={apiBase}
+        context={context}
       />
     );
   }
@@ -1029,7 +1034,10 @@ function MobileView({
   partialTranscript,
   captureStatus,
   switchToDesktop,
-  switchToAbout
+  switchToAbout,
+  socket,
+  apiBase,
+  context
 }: {
   socketConnected: boolean;
   serverReady: ServerReady | null;
@@ -1048,7 +1056,157 @@ function MobileView({
   captureStatus: CaptureStatus | null;
   switchToDesktop: () => void;
   switchToAbout: () => void;
+  socket: import("socket.io-client").Socket | null;
+  apiBase: string;
+  context: ContextForm;
 }) {
+  const [mobileCapturing, setMobileCapturing] = useState(false);
+  const [mobilePaused, setMobilePaused] = useState(false);
+  const [mobileError, setMobileError] = useState("");
+  const [mobileDetected, setMobileDetected] = useState("");
+
+  const mobileVideoRef = useRef<HTMLVideoElement | null>(null);
+  const mobileStreamRef = useRef<MediaStream | null>(null);
+  const mobileVisionTimerRef = useRef<number | null>(null);
+  const mobileRecorderRef = useRef<MediaRecorder | null>(null);
+  const mobileAudioBusyRef = useRef(false);
+  const mobileAudioChunksRef = useRef<Blob[]>([]);
+  const mobileContextRef = useRef(context);
+  const mobileRoomRef = useRef(roomId);
+
+  useEffect(() => { mobileContextRef.current = context; }, [context]);
+  useEffect(() => { mobileRoomRef.current = roomId; }, [roomId]);
+
+  useEffect(() => {
+    return () => {
+      stopMobileCapture();
+    };
+  }, []);
+
+  async function startMobileCapture() {
+    setMobileError("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      });
+      mobileStreamRef.current = stream;
+      if (mobileVideoRef.current) {
+        mobileVideoRef.current.srcObject = stream;
+        await mobileVideoRef.current.play().catch(() => undefined);
+      }
+      setMobileCapturing(true);
+      setMobilePaused(false);
+      startMobileVisionLoop();
+      startMobileAudioRecorder(stream);
+    } catch (err) {
+      setMobileError(err instanceof Error ? err.message : "Could not access camera or microphone.");
+    }
+  }
+
+  function pauseMobileCapture() {
+    stopMobileVisionLoop();
+    if (mobileRecorderRef.current?.state === "recording") {
+      mobileRecorderRef.current.pause();
+    }
+    setMobilePaused(true);
+  }
+
+  function resumeMobileCapture() {
+    startMobileVisionLoop();
+    if (mobileRecorderRef.current?.state === "paused") {
+      mobileRecorderRef.current.resume();
+    }
+    setMobilePaused(false);
+  }
+
+  function stopMobileCapture() {
+    stopMobileVisionLoop();
+    if (mobileRecorderRef.current && mobileRecorderRef.current.state !== "inactive") {
+      mobileRecorderRef.current.stop();
+    }
+    mobileRecorderRef.current = null;
+    mobileAudioBusyRef.current = false;
+    mobileAudioChunksRef.current = [];
+    mobileStreamRef.current?.getTracks().forEach((t) => t.stop());
+    mobileStreamRef.current = null;
+    if (mobileVideoRef.current) mobileVideoRef.current.srcObject = null;
+    setMobileCapturing(false);
+    setMobilePaused(false);
+  }
+
+  function startMobileVisionLoop() {
+    stopMobileVisionLoop();
+    mobileVisionTimerRef.current = window.setInterval(async () => {
+      const video = mobileVideoRef.current;
+      if (!video || video.readyState < 2) return;
+      try {
+        const dataUrl = captureVideoFrame(video);
+        const res = await fetch(`${apiBase}/api/gemini/vision-question`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageDataUrl: dataUrl, context: mobileContextRef.current })
+        });
+        const payload = await res.json();
+        if (payload.ok && payload.question && payload.confidence >= 0.55) {
+          setMobileDetected(payload.question);
+          socket?.emit("question:detected", { roomId: mobileRoomRef.current, question: payload.question, source: "mobile-vision" });
+        }
+      } catch {
+        // silent — vision errors are non-critical
+      }
+    }, 10000);
+  }
+
+  function stopMobileVisionLoop() {
+    if (mobileVisionTimerRef.current) {
+      window.clearInterval(mobileVisionTimerRef.current);
+      mobileVisionTimerRef.current = null;
+    }
+  }
+
+  function startMobileAudioRecorder(stream: MediaStream) {
+    const audioTracks = stream.getAudioTracks();
+    if (!audioTracks.length) return;
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+    try {
+      const recorder = new MediaRecorder(new MediaStream(audioTracks), mimeType ? { mimeType } : undefined);
+      mobileRecorderRef.current = recorder;
+      mobileAudioChunksRef.current = [];
+
+      recorder.ondataavailable = async (event) => {
+        if (!event.data.size) return;
+        mobileAudioChunksRef.current = [...mobileAudioChunksRef.current, event.data].slice(-3);
+        if (mobileAudioBusyRef.current) return;
+        mobileAudioBusyRef.current = true;
+        try {
+          const combinedType = recorder.mimeType || event.data.type || "audio/webm";
+          const blob = new Blob(mobileAudioChunksRef.current, { type: combinedType });
+          const dataUrl = await blobToDataUrl(blob);
+          const res = await fetch(`${apiBase}/api/gemini/audio-question`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ audioDataUrl: dataUrl, context: mobileContextRef.current })
+          });
+          const payload = await res.json();
+          if (payload.ok && payload.question && payload.confidence >= 0.35) {
+            setMobileDetected(payload.question);
+            socket?.emit("question:detected", { roomId: mobileRoomRef.current, question: payload.question, source: "mobile-audio" });
+          }
+        } catch {
+          // silent
+        } finally {
+          mobileAudioBusyRef.current = false;
+        }
+      };
+      recorder.start(8000);
+    } catch (err) {
+      setMobileError(err instanceof Error ? err.message : "Could not start audio recorder.");
+    }
+  }
+
   return (
     <div className="safe-mobile bg-slate-950 text-slate-100">
       <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col px-4 py-4">
@@ -1067,9 +1225,8 @@ function MobileView({
           <section className="flex flex-1 flex-col justify-center gap-4">
             <div>
               <h2 className="text-3xl font-black tracking-normal text-white">Join room</h2>
-              <p className="mt-2 text-base leading-7 text-slate-400">Enter the desktop room ID to receive the live practice feed.</p>
+              <p className="mt-2 text-base leading-7 text-slate-400">Enter the room ID to start capturing.</p>
             </div>
-
             <input
               value={joinInput}
               onChange={(event) => setJoinInput(event.target.value.toUpperCase())}
@@ -1097,17 +1254,70 @@ function MobileView({
           </section>
         ) : (
           <main className="flex flex-1 flex-col gap-4 py-4">
-            <section className="rounded-lg border border-cyan-400/30 bg-cyan-400/10 p-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-xs uppercase tracking-[0.18em] text-cyan-200">Current State</p>
-                  <p className="mt-1 text-sm text-cyan-50">{captureStatus?.detail || "Waiting for desktop capture."}</p>
-                </div>
-                <Activity className={captureStatus?.state === "streaming" ? "text-emerald-300" : "text-slate-500"} />
+            {/* Capture controls */}
+            <section className="rounded-lg border border-slate-700 bg-slate-900 p-3">
+              <div className="mb-3 flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Capture</p>
+                {mobileCapturing && !mobilePaused && (
+                  <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-300">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+                    Live
+                  </span>
+                )}
+                {mobilePaused && (
+                  <span className="text-xs font-semibold text-amber-300">Paused</span>
+                )}
               </div>
-              {partialTranscript && (
-                <p className="mt-3 line-clamp-2 rounded-md bg-slate-950/60 p-2 text-sm leading-6 text-slate-300">{partialTranscript}</p>
+
+              <video ref={mobileVideoRef} muted playsInline className={`mb-3 w-full rounded-md bg-slate-950 object-cover ${mobileCapturing && !mobilePaused ? "block aspect-video" : "hidden"}`} />
+
+              <div className="flex gap-2">
+                {!mobileCapturing ? (
+                  <button
+                    type="button"
+                    onClick={startMobileCapture}
+                    className="flex flex-1 items-center justify-center gap-2 rounded-md bg-emerald-400 px-4 py-3 font-semibold text-slate-950"
+                  >
+                    <Camera size={18} />
+                    Start Capture
+                  </button>
+                ) : mobilePaused ? (
+                  <button
+                    type="button"
+                    onClick={resumeMobileCapture}
+                    className="flex flex-1 items-center justify-center gap-2 rounded-md bg-cyan-400 px-4 py-3 font-semibold text-slate-950"
+                  >
+                    <Play size={18} />
+                    Resume
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={pauseMobileCapture}
+                    className="flex flex-1 items-center justify-center gap-2 rounded-md bg-amber-400 px-4 py-3 font-semibold text-slate-950"
+                  >
+                    <Pause size={18} />
+                    Pause
+                  </button>
+                )}
+                {mobileCapturing && (
+                  <button
+                    type="button"
+                    onClick={stopMobileCapture}
+                    className="flex items-center justify-center gap-2 rounded-md bg-slate-700 px-4 py-3 font-semibold text-slate-200"
+                  >
+                    <Square size={18} />
+                    Stop
+                  </button>
+                )}
+              </div>
+
+              {mobileDetected && (
+                <p className="mt-3 line-clamp-2 rounded-md bg-slate-950 p-2 text-sm leading-6 text-slate-300">
+                  {mobileDetected}
+                </p>
               )}
+              {mobileError && <div className="mt-2"><ErrorBox message={mobileError} /></div>}
             </section>
 
             <section className="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
@@ -1128,15 +1338,14 @@ function MobileView({
                 </div>
                 {pending ? <Loader2 className="animate-spin text-emerald-300" /> : <Sparkles className="text-emerald-300" />}
               </div>
-
               {pending && !latestAnswer ? (
                 <LoadingAnswer mobile />
               ) : latestAnswer ? (
                 <AnswerCard answer={latestAnswer} mobile />
               ) : (
-                <div className="flex min-h-72 flex-col items-center justify-center gap-3 text-center text-slate-500">
+                <div className="flex min-h-52 flex-col items-center justify-center gap-3 text-center text-slate-500">
                   <Bot size={42} />
-                  <p className="max-w-xs text-base leading-7">Answer drafts will update here as practice questions are detected.</p>
+                  <p className="max-w-xs text-base leading-7">Tap Start Capture, point your camera at the interview screen, and answers will appear here.</p>
                 </div>
               )}
             </section>
