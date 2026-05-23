@@ -499,7 +499,7 @@ export default function App() {
       } catch (visionError) {
         setWarnings((current) => uniqueList([...current, `Screen text scan issue: ${shortError(visionError)}`]));
       }
-    }, 4500);
+    }, 10000);
   }
 
   function stopVisionLoop() {
@@ -603,7 +603,7 @@ export default function App() {
           lastResult: "Browser MediaRecorder reported an audio recording error."
         }));
       };
-      recorder.start(2200);
+      recorder.start(8000);
     } catch (audioError) {
       setWarnings((current) => uniqueList([...current, `Could not start shared audio scan: ${shortError(audioError)}`]));
     }
@@ -839,7 +839,7 @@ export default function App() {
                     icon={<ScanText size={18} />}
                     title="Screen Text Scan"
                     detail="Reads visible questions from the shared screen."
-                    status={isCapturing ? "Scanning every 4.5s" : "Ready before capture"}
+                    status={isCapturing ? "Scanning every 10s" : "Ready before capture"}
                   />
                   <ToggleCard
                     enabled={audioAssistEnabled}
