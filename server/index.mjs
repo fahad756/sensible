@@ -33,6 +33,7 @@ const io = new Server(server, {
 
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 const sessions = new Map();
+const pendingFrameRequests = new Map();
 
 app.use(
   cors({
@@ -132,6 +133,7 @@ io.on("connection", (socket) => {
       status: "ready",
       questions: [],
       answers: [],
+      conversationHistory: [],
       clients: new Set([socket.id]),
       lastQuestionKey: "",
       lastQuestionAt: 0
@@ -260,6 +262,77 @@ io.on("connection", (socket) => {
     }
   });
 
+  socket.on("gemini:request", async (payload, ack) => {
+    const reply = toAck(ack);
+    const roomId = socket.data.roomId || String(payload?.roomId || "").trim().toUpperCase();
+    const session = sessions.get(roomId);
+    if (!session) {
+      reply({ ok: false, error: "No active session." });
+      return;
+    }
+
+    const transcript = sanitizeText(payload?.transcript, 2000);
+    const requestId = nanoid(8);
+
+    io.to(roomId).emit("answer:pending", { questionId: requestId, at: Date.now() });
+
+    // Ask producer to capture current frame
+    const producerSocket = session.producerSocketId
+      ? io.sockets.sockets.get(session.producerSocketId)
+      : null;
+
+    let imageDataUrl = null;
+    if (producerSocket) {
+      imageDataUrl = await new Promise((resolve) => {
+        const timeoutId = setTimeout(() => {
+          pendingFrameRequests.delete(requestId);
+          resolve(null);
+        }, 5000);
+        pendingFrameRequests.set(requestId, { resolve, timeoutId });
+        producerSocket.emit("capture:frame", { requestId });
+      });
+    }
+
+    try {
+      const result = await generateAnswerWithCapture({
+        imageDataUrl,
+        transcript,
+        context: session.context,
+        history: session.conversationHistory
+      });
+
+      const answerEvent = {
+        id: nanoid(12),
+        questionId: requestId,
+        question: transcript || "(screen capture)",
+        answer: result.text,
+        model: result.model,
+        latencyMs: result.latencyMs,
+        at: Date.now()
+      };
+
+      session.conversationHistory.push({ question: transcript || "(screen capture)", answer: result.text });
+      session.conversationHistory = session.conversationHistory.slice(-6);
+
+      session.answers.unshift(answerEvent);
+      session.answers = session.answers.slice(0, 40);
+      io.to(roomId).emit("answer:ready", answerEvent);
+      reply({ ok: true });
+    } catch (error) {
+      io.to(roomId).emit("answer:error", { questionId: requestId, at: Date.now(), error: publicError(error) });
+      reply({ ok: false, error: publicError(error) });
+    }
+  });
+
+  socket.on("frame:ready", (payload) => {
+    const requestId = String(payload?.requestId || "");
+    const pending = pendingFrameRequests.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    pendingFrameRequests.delete(requestId);
+    pending.resolve(payload?.imageDataUrl || null);
+  });
+
   socket.on("disconnect", () => {
     const roomId = socket.data.roomId;
     const session = roomId ? sessions.get(roomId) : null;
@@ -329,6 +402,40 @@ function publicSession(session) {
     recentQuestions: session.questions.slice(0, 10),
     recentAnswers: session.answers.slice(0, 10)
   };
+}
+
+async function generateAnswerWithCapture({ imageDataUrl, transcript, context, history }) {
+  if (!ai) throw new Error("Sensible engine is not configured. Set the server API key.");
+
+  const startedAt = Date.now();
+  const historyText = history.length > 0
+    ? "\n\nPrevious exchanges this session:\n" + history.map((h) => `Q: ${h.question}\nA: ${h.answer}`).join("\n---\n")
+    : "";
+
+  const promptText = buildAnswerPrompt({ question: transcript || "What is the main question or topic visible on screen?", context }) + historyText;
+  const parsed = imageDataUrl ? parseDataUrl(imageDataUrl) : null;
+
+  const contents = parsed
+    ? [{ role: "user", parts: [{ inlineData: { mimeType: parsed.mimeType, data: parsed.data } }, { text: promptText }] }]
+    : promptText;
+
+  try {
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model: primaryModel,
+        contents,
+        config: { systemInstruction: answerSystemInstruction(), temperature: 0.48, topP: 0.9, maxOutputTokens: 360 }
+      }),
+      15000
+    );
+    return { text: normalizeModelText(response.text), model: primaryModel, latencyMs: Date.now() - startedAt };
+  } catch {
+    const text = await withTimeout(
+      generateText({ model: fallbackModel || primaryModel, systemInstruction: fallbackSystemInstruction(), prompt: promptText, maxOutputTokens: 300 }),
+      15000
+    );
+    return { text, model: fallbackModel || primaryModel, latencyMs: Date.now() - startedAt };
+  }
 }
 
 async function generateAnswer({ question, context }) {

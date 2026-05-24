@@ -228,6 +228,19 @@ export default function App() {
       setPending(null);
       setError(payload.error || "Sensible response failed.");
     });
+    nextSocket.on("capture:frame", async (payload: { requestId: string }) => {
+      const video = videoRef.current;
+      if (!video || !streamRef.current || video.readyState < 2) {
+        nextSocket.emit("frame:ready", { requestId: payload.requestId, imageDataUrl: null });
+        return;
+      }
+      try {
+        const dataUrl = captureVideoFrame(video);
+        nextSocket.emit("frame:ready", { requestId: payload.requestId, imageDataUrl: dataUrl });
+      } catch {
+        nextSocket.emit("frame:ready", { requestId: payload.requestId, imageDataUrl: null });
+      }
+    });
 
     return () => {
       nextSocket.disconnect();
@@ -469,6 +482,13 @@ export default function App() {
     });
   }, [manualQuestion, roomId, socket]);
 
+  const askSensible = useCallback(() => {
+    if (!socket || !roomId) return;
+    const transcript = partialTranscript;
+    setPartialTranscript("");
+    socket.emit("gemini:request", { roomId, transcript });
+  }, [socket, roomId, partialTranscript]);
+
   function emitCaptureStatus(state: string, detail: string) {
     socket?.emit("capture:status", { state, detail });
     setCaptureStatus({ at: Date.now(), state, detail });
@@ -497,7 +517,7 @@ export default function App() {
             text: payload.question,
             source: "screen-vision"
           });
-          maybeSubmitQuestion(payload.question, "vision");
+          // answer generation is manual via mobile Ask button
         }
       } catch (visionError) {
         setWarnings((current) => uniqueList([...current, `Screen text scan issue: ${shortError(visionError)}`]));
@@ -579,7 +599,7 @@ export default function App() {
               text: payload.question,
               source: "screen-audio"
             });
-            maybeSubmitQuestion(payload.question, "screen-audio");
+            // answer generation is manual via mobile Ask button
             setSharedAudio((current) => ({
               ...current,
               lastResult: `Question detected from shared audio (${Math.round(payload.confidence * 100)}%).`
@@ -700,6 +720,7 @@ export default function App() {
         captureStatus={captureStatus}
         switchToDesktop={() => setView("desktop")}
         switchToAbout={() => setView("about")}
+        onAsk={askSensible}
       />
     );
   }
@@ -1048,6 +1069,7 @@ function MobileView({
   captureStatus,
   switchToDesktop,
   switchToAbout,
+  onAsk,
 }: {
   socketConnected: boolean;
   serverReady: ServerReady | null;
@@ -1066,6 +1088,7 @@ function MobileView({
   captureStatus: CaptureStatus | null;
   switchToDesktop: () => void;
   switchToAbout: () => void;
+  onAsk: () => void;
 }) {
   return (
     <div className="safe-mobile bg-slate-950 text-slate-100">
@@ -1129,11 +1152,21 @@ function MobileView({
 
             <section className="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
               <div className="mb-2 flex items-center justify-between">
-                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Latest Question</p>
+                <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Detected transcript</p>
                 <span className="text-xs text-slate-500">{latestQuestion ? timeAgo(latestQuestion.at) : ""}</span>
               </div>
-              <p className="text-xl font-semibold leading-8 text-white">{latestQuestion?.question || "No question detected yet."}</p>
+              <p className="text-sm leading-7 text-slate-300">{partialTranscript || latestQuestion?.question || "Transcript will appear here as audio is detected."}</p>
             </section>
+
+            <button
+              type="button"
+              onClick={onAsk}
+              disabled={!!pending}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-cyan-400 py-4 text-lg font-black text-slate-950 transition active:scale-95 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+            >
+              {pending ? <Loader2 size={20} className="animate-spin" /> : <Sparkles size={20} />}
+              {pending ? "Asking Sensible..." : "Ask Sensible"}
+            </button>
 
             <section className="flex-1 rounded-lg border border-emerald-400/25 bg-gradient-to-br from-slate-900 to-slate-950 p-4 shadow-glow">
               <div className="mb-3 flex items-center justify-between gap-3">
